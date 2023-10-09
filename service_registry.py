@@ -307,6 +307,36 @@ class ServiceRegistry:
             self.service_tracing["duration"] += duration
 
 
+class ServiceRegistryManagement(ServiceRegistry):
+    def __init__(self) -> None:
+        super().__init__()
+        self.dependency_map = {}
+
+    def register_dependency(self, service_name: str, depends_on: str) -> None:
+        if service_name not in self.dependency_map:
+            self.dependency_map[service_name] = []
+        self.dependency_map[service_name].append(depends_on)
+        self.log(
+            f"Successful register the dependencies between {service_name} that depends on {depends_on} services"
+        )
+
+    def get_dependencies(self, service_name: str) -> typing.Any:
+        return self.dependency_map.get(service_name, [])
+
+    def is_service_ready(self, service_name: str) -> bool:
+        dependencies = self.get_dependencies(service_name)
+        return all(self.get_available_services(dep) for dep in dependencies)
+
+    def wait_for_dependencies(self, service_name: str, timeout: int = 30) -> bool:
+        start_time = self.timestamp
+        while not self.is_service_ready(service_name):
+            if self.timestamp - start_time > timeout:
+                return False
+            # for now just align the sleep interval with the health check
+            time.sleep(self.health_check_interval)
+        return True
+
+
 if __name__ == "__main__":
     registry = ServiceRegistry()
 
@@ -343,6 +373,27 @@ if __name__ == "__main__":
 
     get_url = registry.get_available_services("GetSinglePost")
     print(get_url)
+
+    # usage of extended service registry
+    # first, we need to register the services first and initialize the instance
+    extended_registry = ServiceRegistryManagement()
+    extended_registry.register_services(
+        "ServiceA", "https://jsonplaceholder.typicode.com/posts/1"
+    )
+    extended_registry.register_services(
+        "ServiceB", "https://jsonplaceholder.typicode.com/posts/2"
+    )
+
+    # and now we will register for each dependencies
+    extended_registry.register_dependency("ServiceA", "ServiceB")
+
+    # check whether the dependent service is available or not
+    get_services_ready = extended_registry.is_service_ready("ServiceB")
+    if get_services_ready:
+        print("Each services are ready, no need to wait")
+    else:
+        # wait another services until it's ready
+        extended_registry.wait_for_dependencies("ServiceB")
 
     # this will thrown a failure since the service name is unhealthy
     # and all of the process will halted directly
