@@ -60,9 +60,40 @@ https://jsonplaceholder.typicode.com/posts
 
 Or, you can adjust the procedure for running it in accordance with what you want to do (you might need to take a look in the built-in APIs directly from the source code to ensure what's the public method that you want to initialize)
 
+### Getting Started with the API
+
+You need to install the Flask library to run the core API of this library, and the server starts on `http://localhost:5000` by default. For example if you want to register a service, you can use the following API:
+
+**Register a service**
+
+```sh
+curl -X POST http://localhost:5000/api/services \
+  -H "Content-Type: application/json" \
+  -d '{"service_name": "GetAllPosts", "service_url": "https://jsonplaceholder.typicode.com/posts"}'
+```
+
+**Get an available service URL**
+
+```sh
+curl http://localhost:5000/api/service/GetAllPosts
+```
+
+**Simulate a service failure**
+
+```sh
+curl -X POST http://localhost:5000/api/services/GetAllPosts/fail
+```
+
+**View tracing metrics**
+
+```sh
+curl http://localhost:5000/api/metrics
+```
+
 ### Caveats
 
-Currently, this library doesn't support the asynchronous method so the choice of assigned available service will be based on the first index (this will lead to a problem if the service is also down)
+- No async support. By all means, the service assignment is synchronous and resolves to the first available index. If that service is also unhealthy, no fallback will be attempted automatically
+- In-memory state. All registry data is held in memory and does not persist across restarts
 
 ### Acknowledgment
 
