@@ -2,9 +2,9 @@ import logging
 import requests
 import time
 import threading
-import atexit
 import enum
 import typing
+from config import DEFAULT_HEADERS
 
 
 class CircuitBreakerException(BaseException):
@@ -96,20 +96,24 @@ class ServiceRegistry:
             "duration": 0,
         }
         self.timestamp = time.time()
+        self._setup_logger()
+
+    def _setup_logger(self) -> None:
+        self.logger = logging.getLogger(f"service_registry_{id(self)}")
+        self.logger.setLevel(logging.DEBUG)
+        if not self.logger.handlers:
+            handler = logging.StreamHandler()
+            handler.setFormatter(
+                logging.Formatter(
+                    fmt="%(asctime)s : %(filename)s : %(funcName)s : %(message)s",
+                    datefmt="%d-%m-%Y %I:%M:%S",
+                ),
+            )
+            self.logger.addHandler(handler)
+        self.logger.propagate = False
 
     def log(self, message: str) -> None:
-        logger = logging.getLogger("http_service_registry_logs")
-        log_handler = logging.StreamHandler()
-        log_handler.setFormatter(
-            logging.Formatter(
-                fmt="%(asctime)s : %(filename)s : %(funcName)s : %(message)s",
-                datefmt="%d-%m-%Y %I:%M:%S",
-            ),
-        )
-        logger.addHandler(log_handler)
-        logger.setLevel(logging.DEBUG)
-        logger.propagate = True
-        logger.info(message)
+        self.logger.info(message)
 
     def register_services(self, service_name: str, service_url: str) -> None:
         if service_name in self.registered_services:
@@ -197,44 +201,39 @@ class ServiceRegistry:
 
     def _health_check(self) -> None:
         while True:
-            for service_name in self.registered_services:
-                is_service_healthy = self._simulate_health_check(service_name)
-                self.registered_services[service_name]["healthy"] = is_service_healthy
+            try:
+                for service_name in self.registered_services:
+                    self._simulate_health_check(service_name)
+            except Exception as e:
+                self.log(f"Health check error: {e}")
             time.sleep(self.health_check_interval)
 
     def _make_http_request(self, service_url: str) -> requests.Response:
-        session = requests.Session()
-        response = session.get(url=service_url)
+        response = requests.get(url=service_url, headers=DEFAULT_HEADERS, timeout=10)
         response.raise_for_status()
         return response
 
     @circuit_breaker(threhsold=3, timeout=5)
-    def _simulate_health_check(self, service_name: str) -> None:
-        while True:
-            try:
-                service_url = self.registered_services[service_name]["url"]
-                response = self._make_http_request(service_url)
-                if response.status_code == 200:
-                    if self.registered_services[service_name]["healthy"]:
-                        self.registered_services[service_name][
-                            "availability"
-                        ] = ServiceRegistryState.AVAILABLE
-                        self.registered_services[service_name]["healthy"] = True
-                        self.log("Related service is healthy")
-                    else:
-                        self.registered_services[service_name][
-                            "availability"
-                        ] = ServiceRegistryState.DOWN
-                        self.registered_services[service_name]["healthy"] = False
-                        self.log("Related service is unhealthy")
-            except requests.exceptions.RequestException as e:
-                self.registered_services[service_name]["healthy"] = False
-
-                # marked all of the exceptions that occurs as failure request
-                self.service_tracing["failure_requests"] += 1
-                raise Exception(f"Unable to make a request due of error : {e}")
-
-            time.sleep(self.health_check_interval)
+    def _simulate_health_check(self, service_name: str) -> bool:
+        try:
+            service_url = self.registered_services[service_name]["url"]
+            response = self._make_http_request(service_url)
+            if response.status_code == 200:
+                self.registered_services[service_name][
+                    "availability"
+                ] = ServiceRegistryState.AVAILABLE
+                self.registered_services[service_name]["healthy"] = True
+                self.log("Related service is healthy")
+                return True
+        except requests.exceptions.RequestException as e:
+            self.registered_services[service_name][
+                "availability"
+            ] = ServiceRegistryState.DOWN
+            self.registered_services[service_name]["healthy"] = False
+            self.service_tracing["failure_requests"] += 1
+            self.log(f"Related service is unhealthy due to error: {e}")
+            return False
+        return False
 
     def assign_service(self, service_name: str, assigned_service_name: str) -> None:
         if service_name in self.registered_services:
@@ -335,80 +334,3 @@ class ServiceRegistryManagement(ServiceRegistry):
             # for now just align the sleep interval with the health check
             time.sleep(self.health_check_interval)
         return True
-
-
-if __name__ == "__main__":
-    registry = ServiceRegistry()
-
-    # register all the related services
-    registry.register_services(
-        "GetSinglePost", "https://jsonplaceholder.typicode.com/posts/1"
-    )
-    registry.register_services(
-        "GetAllPosts", "https://jsonplaceholder.typicode.com/posts"
-    )
-
-    registry.start_health_check()
-
-    check_duration = time.sleep(5)
-    while check_duration:
-        pass
-
-    result_val = registry.get_services_information()
-    print(result_val)
-
-    # tracing between request
-    registry.trace_service_request("GetSinglePost")
-    print(registry.service_tracing)
-
-    registry.get_service("GetSinglePost")
-
-    # simulate the one of the services are unhealthy
-    registry.simulate_service_is_unhealthy("GetSinglePost")
-
-    print(registry.service_tracing)
-
-    # assign the "unhealthy" services to the available service
-    registry.assign_service("GetSinglePost", "GetAllPosts")
-
-    get_url = registry.get_available_services("GetSinglePost")
-    print(get_url)
-
-    # usage of extended service registry
-    # first, we need to register the services first and initialize the instance
-    extended_registry = ServiceRegistryManagement()
-    extended_registry.register_services(
-        "ServiceA", "https://jsonplaceholder.typicode.com/posts/1"
-    )
-    extended_registry.register_services(
-        "ServiceB", "https://jsonplaceholder.typicode.com/posts/2"
-    )
-
-    # and now we will register for each dependencies
-    extended_registry.register_dependency("ServiceA", "ServiceB")
-
-    # check whether the dependent service is available or not
-    get_services_ready = extended_registry.is_service_ready("ServiceB")
-    if get_services_ready:
-        print("Each services are ready, no need to wait")
-    else:
-        # wait another services until it's ready
-        extended_registry.wait_for_dependencies("ServiceB")
-
-    # this will thrown a failure since the service name is unhealthy
-    # and all of the process will halted directly
-    # registry.get_service("GetSinglePost")
-
-    # de-register all of the services whether it's up or down
-    # registry.deregister_all_services()
-
-    # de-register a certain service based on the service name
-    # registry.deregister_service("GetAllPosts")
-
-    # gracefully shutdown a single service
-    registry.gracefully_shutdown("GetSinglePost")
-
-    # this will return the value as None since we already
-    # gracefully shut-in down the GetSinglePost service
-    get_url = registry.get_available_services("GetSinglePost")
-    print(get_url)

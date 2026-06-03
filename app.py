@@ -1,16 +1,21 @@
 from flask import Flask, request, jsonify
-from service_registry import ServiceRegistryManagement
+from utils import check_downstream_health, DEFAULT_HEADERS
+from config import DOWNSTREAM_SERVICES
+from services import registry
 
 app = Flask(__name__)
-
-
-registry = ServiceRegistryManagement()
-registry.start_health_check()
 
 
 @app.route("/api/health", methods=["GET"])
 def health():
     return jsonify({"status": "OK"}), 200
+
+
+# this API will check the health of the downstream services
+@app.route("/api/external-health", methods=["GET"])
+def external_health():
+    result = check_downstream_health(DOWNSTREAM_SERVICES, DEFAULT_HEADERS)
+    return jsonify(result), 200
 
 
 # register the relevant/particular downstream services here so it can be exposed through Flask APIs
@@ -51,7 +56,7 @@ def get_service(service_name):
 
 
 # assigne particular service
-@app.route("/api/services/assign", methods=["GET"])
+@app.route("/api/services/assign", methods=["POST"])
 def assign_service():
     data = request.get_json()
 
@@ -62,7 +67,7 @@ def assign_service():
         return jsonify({"error": "missing parameter"}), 400
 
     registry.assign_service(
-        service_name=service_name, assigned_service_name=assign_service
+        service_name=service_name, assigned_service_name=assigned_service
     )
     return jsonify({"message": "Successfully assigned particular service"}), 200
 
@@ -129,4 +134,4 @@ def add_dependency():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000, host="0.0.0.0")
+    app.run(debug=False, port=5000, host="0.0.0.0", threaded=True)
