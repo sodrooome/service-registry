@@ -8,6 +8,7 @@ services:
       - "5000:5000"
     environment:
       - PYTHONUNBUFFERED=1
+    env_file: .env
       # Optional: tweak gunicorn workers without rebuilding image
       # - GUNICORN_WORKERS=4
     restart: always
