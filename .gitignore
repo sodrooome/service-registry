@@ -1,2 +1,4 @@
 __pycache__/
 .env
+.omo/
+.pytest_cache/
