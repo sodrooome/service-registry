@@ -223,6 +223,7 @@ class ServiceRegistry:
                     "availability"
                 ] = ServiceRegistryState.AVAILABLE
                 self.registered_services[service_name]["healthy"] = True
+                self.service_tracing["successful_requests"] += 1
                 self.log("Related service is healthy")
                 return True
         except requests.exceptions.RequestException as e:
@@ -279,7 +280,7 @@ class ServiceRegistry:
         return services_result
 
     def trace_service_request(self, service_name: str) -> None:
-        start_time = self.timestamp
+        start_time = time.time()
 
         if service_name not in self.registered_services:
             raise ValueError(
@@ -294,7 +295,7 @@ class ServiceRegistry:
             success = False
             raise RequestCallException
         finally:
-            end_time = self.timestamp
+            end_time = time.time()
             duration = end_time - start_time
 
             self.service_tracing["total_requests"] += 1
