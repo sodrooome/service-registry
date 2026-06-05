@@ -1,6 +1,6 @@
 # Service Registry Architecture
 
-This document explains the internals of the service registry library and the topology mesh that has been wired up.
+This document explains the internals of the service registry management library and the topology mesh that has been wired up within MauKerja chat services on the production environment. It covers the design decisions, data flow, and how the library simulates a service registry pattern with circuit breaker and health checking features. The document also includes API endpoints, usage examples, and future considerations for production deployment
 
 ## 1. Overview
 
@@ -8,15 +8,15 @@ The library implements a lightweight service registry pattern inspired by Netfli
 
 | Feature | Purpose |
 |---------|---------|
-| **Service Registration** | Register a service name → URL mapping and hold it in memory. |
-| **Service Assignment** | Route a service to another one so the caller always hits an available instance. |
-| **Health Checking** | Periodically probe each registered URL and mark it `AVAILABLE`, `STARTING`, or `DOWN`. |
-| **Circuit Breaker** | After 3 consecutive failures, open the circuit and stop hammering the unhealthy service for 5 seconds. |
-| **Request Tracing** | Count total, successful, and failed requests, and measure cumulative duration. |
+| **Service Registration** | Register a service name, URL mapping and hold it in memory |
+| **Service Assignment** | Route a service to another one so the caller always hits an available instance |
+| **Health Checking** | Periodically probe each registered URL and mark it `AVAILABLE`, `STARTING`, or `DOWN` |
+| **Circuit Breaker** | After 3 consecutive failures, open the circuit and stop hammering the unhealthy service for 5 seconds |
+| **Request Tracing** | Count total, successful, and failed requests, and measure cumulative duration |
 
 ## 2. Topology Mesh
 
-The system is pre-registered with five downstream services. Two of them are chained together via assignments, while three others are independent. Dependencies define readiness constraints.
+The current implementation as per the first week of June 2026, the system is pre-registered with five downstream services which are related to the Chat services that are widely used on the MauKerja platform. Two of them are chained together via assignments, while three others are independent. Dependencies define readiness constraints:
 
 ```mermaid
 graph LR
@@ -65,7 +65,7 @@ sequenceDiagram
 
 ### 2.2 Dependencies
 
-A dependency means a service will only be considered *ready* when all the services it depends on are healthy.
+A background daemon thread wakes up every 5 seconds and probes each registered service URL. The request includes real browser headers to bypass CloudFlare bot detection such as with user-agent or upgrade-insecure-requests.
 
 | Service | Readiness Gate |
 |---------|-------------|
@@ -77,7 +77,7 @@ A dependency means a service will only be considered *ready* when all the servic
 
 ## 3. Health Checking
 
-A background daemon thread wakes up every 5 seconds and probes each registered service URL.
+A background daemon thread wakes up every 5 seconds and probes each registered service URL. The request includes real browser headers to bypass CloudFlare bot detection such as with `user-agent` or `upgrade-insecure-requests`.
 
 ```mermaid
 flowchart TD
@@ -96,14 +96,12 @@ flowchart TD
   B -->|No| K[Wait...]
 ```
 
-The request includes real browser headers to bypass CloudFlare bot detection (User-Agent, Accept, Sec-Fetch-*, etc.).
-
 ## 4. Circuit Breaker
 
 Every health check call is wrapped in a circuit breaker with:
 
 - **Threshold:** 3 consecutive failures before opening the circuit
-- **Timeout:** 5 seconds in OPEN state before trying again (HALF_OPEN)
+- **Timeout:** 5 seconds in OPEN state before trying again (`HALF_OPEN`)
 
 ```mermaid
 stateDiagram-v2
@@ -138,7 +136,7 @@ flowchart LR
 
 ## 6. Simulating Failures
 
-You can force a service into the `DOWN` state with `POST /api/services/<name>/fail`.
+You can force a service into the `DOWN` state with `POST /api/services/<name>/fail`. This is quite straightforward and pretty useful for testing how upstream services react when a downstream dependency disappears. Since, the main sources of the Chat services were invoked through different party
 
 ```mermaid
 sequenceDiagram
@@ -153,8 +151,6 @@ sequenceDiagram
   Registry->>Registry: Check dependencies
   Registry-->>Client: 503 Not Ready
 ```
-
-This is useful for testing how upstream services react when a downstream dependency disappears.
 
 ## 7. API Endpoints
 
@@ -202,10 +198,11 @@ flowchart TB
 
 ## 9. Caveats
 
-- **In-memory only.** All state is lost when the process restarts.
-- **Synchronous.** Service resolution and health checks are single-threaded per service.
-- **No persistence.** There is no database or external storage.
-- **Single instance.** No clustering or leader election is implemented.
+At the moment, there were a few items that needed to be addressed before they were going to be adopted or at least made as production-grade ready. Those are:
+
+- **No async support**. By all means, the service assignment is synchronous and resolves to the first available index. If that service is also unhealthy, no fallback will be attempted automatically
+- **In-memory state**. All registry data is held in memory and does not persist across restarts. There is no database or external storage which holds logs or particular events
+- **Single instance**. No clustering or leader election is implemented
 
 ## 10. Getting Started
 
@@ -232,11 +229,11 @@ curl http://localhost:5000/api/metrics
 
 ## 11. History & Origin
 
-This library was initially built as part of the research and development team's effort to implement distributed tracing, alongside tools like Jaeger and OpenTelemetry. Development began in 2023 by the original author as an internal exploration into service mesh patterns and self-healing architectures.
+This library was initially built as part of the research and development team's effort to implement distributed tracing, alongside tools like Jaeger and OpenTelemetry. Development began in 2023 by myself as an internal exploration into service mesh patterns and self-healing architectures.
 
-Initially, the team did not adopt Jaeger or OpenTelemetry back in 2021. However, by the end of 2023, both tracing systems were eventually adopted across the broader platform, and this experimental library was gradually shelved and postponed.
+Initially, the team did not adopt Jaeger or OpenTelemetry back in 2021. However, by the end of 2023, both tracing systems were eventually adopted across the broader platform, and this experimental library was gradually shelved and postponed
 
-Fast forward to 2026: the chat services needed to become fully independent and required their own lightweight monitoring system. In June 2026, this library resurfaced. The Backend and Frontend teams decided to run live experiments with it as a dedicated health-check and service-assignment layer for the chat infrastructure, reviving the original codebase and extending it with real downstream services.
+Fast forward to 2026: the chat services needed to become fully independent and required their own lightweight monitoring system. In June 2026, this library resurfaced. The Backend and Frontend teams decided to run live experiments with it as a dedicated health-check and service-assignment layer for the chat infrastructure, reviving the original codebase and extending it with real downstream services
 
 ## 12. Production Deployment (24/7)
 
@@ -283,17 +280,16 @@ Because the library is in-memory, you should monitor the host itself:
 
 ## 13. Future Considerations
 
-This library is intentionally lightweight, but several enhancements would make it production-grade for a larger mesh:
+This library is intentionally lightweight, but several enhancements would make it production-grade for a larger mesh. Especially, the targeted environment possibly grows larger since we also need to opt-in the Chat services for other platforms
 
 | Improvement | Rationale |
 |-------------|-----------|
 | **Persistent state** | SQLite or Redis so registrations and assignments survive restarts |
 | **Async health checks** | `asyncio` or `aiohttp` to avoid blocking the GIL during slow probes |
-| **Clustering** | Multiple instances with a shared backend (e.g., Consul, etcd) for high availability |
+| **Clustering** | Multiple instances with a shared backend (for example, Consul or etcd) for high availability |
 | **Authentication** | API key or mTLS on the registry endpoints to prevent unauthorized deregistration |
 | **Prometheus metrics** | Export counters and histograms in `/metrics` format for scraping |
 | **Load balancing strategies** | Round-robin or least-latency instead of first-available assignment |
 | **Custom health thresholds** | Per-service timeout and failure-threshold configuration |
-| **Webhook notifications** | Alert Slack / PagerDuty when a downstream service goes DOWN |
 | **Graceful shutdown** | Drain in-flight requests before stopping the health check thread |
 | **TLS termination** | Run Gunicorn with certificates instead of handling TLS inside Flask |
