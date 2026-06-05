@@ -90,6 +90,9 @@ curl -X POST http://localhost:5000/api/services/GetAllPosts/fail
 curl http://localhost:5000/api/metrics
 ```
 
+> [!TIP]
+> If you want to see the detailed information about the design, architecture, complete API reference alongside deployment instructions, you can check the [Architecture Document](./docs/architecture.md) that has been written in a more comprehensive way
+
 ### Caveats
 
 - No async support. By all means, the service assignment is synchronous and resolves to the first available index. If that service is also unhealthy, no fallback will be attempted automatically
