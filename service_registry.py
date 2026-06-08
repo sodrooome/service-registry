@@ -7,11 +7,11 @@ import typing
 from config import DEFAULT_HEADERS
 
 
-class CircuitBreakerException(BaseException):
+class CircuitBreakerException(Exception):
     """Exception that arises when remote call is failed"""
 
 
-class RequestCallException(BaseException):
+class RequestCallException(Exception):
     """Exception that arises when request is failed"""
 
 
@@ -38,7 +38,7 @@ class CircuitBreaker:
 
     def open(self) -> None:
         self.state = CircuitBreakerState.OPEN
-        self.last_time_of_failure = self.timestamp
+        self.last_time_of_failure = time.time()
 
     def close(self) -> None:
         self.state = CircuitBreakerState.CLOSED
@@ -51,12 +51,13 @@ class CircuitBreaker:
         return self.failure_counts >= self.threshold
 
     def handle_reset_state(self) -> typing.Any:
-        return self.timestamp - self.last_time_of_failure >= self.timeout
+        return time.time() - self.last_time_of_failure >= self.timeout
 
     def make_remote_call(self, func) -> typing.Any:
         if self.state == CircuitBreakerState.OPEN:
             if not self.handle_reset_state():
                 return None
+            self.half_open()  # transition to half open state to test the remote call
 
         try:
             result_value = func()
@@ -188,7 +189,7 @@ class ServiceRegistry:
         # currently, this function would be picked
         # the available service based on the first index
         if available_services:
-            return self._get_service_name_url(available_services)
+            return self._get_service_name_url(available_services[0])
 
         return None
 
@@ -233,7 +234,7 @@ class ServiceRegistry:
             self.registered_services[service_name]["healthy"] = False
             self.service_tracing["failure_requests"] += 1
             self.log(f"Related service is unhealthy due to error: {e}")
-            return False
+            raise
         return False
 
     def assign_service(self, service_name: str, assigned_service_name: str) -> None:
@@ -328,9 +329,9 @@ class ServiceRegistryManagement(ServiceRegistry):
         return all(self.get_available_services(dep) for dep in dependencies)
 
     def wait_for_dependencies(self, service_name: str, timeout: int = 30) -> bool:
-        start_time = self.timestamp
+        start_time = time.time()
         while not self.is_service_ready(service_name):
-            if self.timestamp - start_time > timeout:
+            if time.time() - start_time > timeout:
                 return False
             # for now just align the sleep interval with the health check
             time.sleep(self.health_check_interval)
