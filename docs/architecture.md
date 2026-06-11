@@ -65,7 +65,7 @@ sequenceDiagram
 
 ### 2.2 Dependencies
 
-A background daemon thread wakes up every 5 seconds and probes each registered service URL. The request includes real browser headers to bypass CloudFlare bot detection such as with user-agent or upgrade-insecure-requests.
+A dependency means a service will only be considered ready when all the services it depends on are healthy.
 
 | Service | Readiness Gate |
 |---------|-------------|
@@ -95,6 +95,20 @@ flowchart TD
   J --> B
   B -->|No| K[Wait...]
 ```
+
+## 3.1 Thread Safety
+
+Because the health check runs on a background daemon thread while API handlers run on Flask's request threads, shared mutable state needs protection from concurrent access. Every `ServiceRegistry` instance holds a single `threading.Lock` from context manager that guards:
+
+- `registered_services`: all reads, writes, and existence checks acquire the lock
+- `service_tracing`: counter updates for total, success, and failure requests
+
+The lock is acquired via the `with self._lock` context manager so it's always released, even when an exception propagates. Every public method that reads or mutates registry state follows this pattern. Apart from that, there are critical sections that required recent fixes, those are:
+
+- Look up, health check, and return now all happen inside a single critical section. Previously the return sat outside the lock, creating a race where a concurrent `deregister_service` could delete the key between the check and the access
+- The existence guard and the state mutation (`availability`, `healthy`, `failure_requests`) are now covered by the same lock. Previously only the guard was locked, leaving a race window for the mutation
+
+The `CircuitBreaker` class uses a separate dedicated lock to guard the circuit state transitions of circuit breaker alongside `failure_counts`. This is intentionally split from the registry lock to avoid unnecessary contention such as when circuit state and registry state are independent concerns
 
 ## 4. Circuit Breaker
 

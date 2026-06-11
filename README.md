@@ -19,6 +19,7 @@ Given the context, we can implement several features that might help in the proc
 - Distributed services tracing (trace all of the failure and success counts)
 - Built-in logging mechanism
 - Gracefully shutdown a certain service
+- Thread-safe concurrent access with `threading.Lock` synchronization
 
 ### Usage
 
