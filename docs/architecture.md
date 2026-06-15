@@ -148,7 +148,61 @@ flowchart LR
   B -->|200 OK| G[Metrics Updated]
 ```
 
-## 6. Simulating Failures
+## 6. Event History (SQLite Persistence)
+
+The registry keeps runtime state in memory for speed, but that state vanishes on restart. To preserve an audit trail of what happened, every meaningful operation now calls `record_event()` in `metrics.py`, which writes to a local SQLite database (`metrics_history.db`).
+
+### How It Works
+
+Each public operation that mutates or queries registry state triggers a single `INSERT` into the `service_events` table. The row stores a Unix epoch timestamp, the service name, an event type, and a free-text detail string. Because SQLite is embedded, there is no separate server process, thus the database file lives alongside the application
+
+### Transaction Safety
+
+SQLite itself is thread-safe for reads, but concurrent writes can deadlock or corrupt the journal if multiple threads commit at the exact same moment. To avoid this, all write paths acquire a dedicated `threading.Lock` before opening a connection. This serialises inserts so only one thread can commit at a single time
+
+The database is opened in **WAL (Write-Ahead Logging) mode**. WAL allows readers to proceed while a writer is appending to the log, so the `GET /api/history` endpoint never blocks on an active `record_event()` call.
+
+### Event Types
+
+| Event Type | Triggered By | Detail Example |
+|---|---|---|
+| `service_registered` | `register_services()` | URL of the registered service |
+| `service_deregistered` | `deregister_service()` | Name of the deregistered service |
+| `service_assigned` | `assign_service()` | `"ServiceA assigned to ServiceB"` |
+| `service_failure` | `simulate_service_is_unhealthy()` | `"simulated failure"` (only on state transition) |
+| `request_traced` | `trace_service_request()` | Name of the traced service |
+| `dependency_registered` | `register_dependency()` | `"ServiceA depends on ServiceB"` |
+| `health_check_healthy` | `_simulate_health_check()` | `"state changed to AVAILABLE"` (only on transition) |
+| `health_check_unhealthy` | `_simulate_health_check()` | `"state changed to DOWN"` (only on transition) |
+
+### Sequence Diagram
+
+```mermaid
+sequenceDiagram
+    participant Client as HTTP Client
+    participant Flask as Flask API
+    participant Registry as ServiceRegistry
+    participant Metrics as metrics.py (SQLite)
+    participant DB as metrics_history.db
+
+    Client->>Flask: POST /api/services (register)
+    Flask->>Registry: register_services()
+    Registry->>Metrics: record_event("service_registered")
+    Metrics->>DB: INSERT with WAL mode
+    DB-->>Metrics: OK
+    Metrics-->>Registry: done
+    Registry-->>Flask: return
+    Flask-->>Client: 201 Created
+
+    Client->>Flask: GET /api/history
+    Flask->>Metrics: get_events(service_name, event_type, limit)
+    Metrics->>DB: SELECT with filters
+    DB-->>Metrics: rows
+    Metrics-->>Flask: events list
+    Flask-->>Client: JSON array
+```
+
+## 7. Simulating Failures
 
 You can force a service into the `DOWN` state with `POST /api/services/<name>/fail`. This is quite straightforward and pretty useful for testing how upstream services react when a downstream dependency disappears. Since, the main sources of the Chat services were invoked through different party
 
@@ -166,7 +220,7 @@ sequenceDiagram
   Registry-->>Client: 503 Not Ready
 ```
 
-## 7. API Endpoints
+## 8. API Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -181,9 +235,10 @@ sequenceDiagram
 | `GET` | `/api/services/:name/ready` | Check if service is ready (deps healthy) |
 | `POST` | `/api/dependencies` | Register a dependency |
 | `GET` | `/api/metrics` | Read request tracing counters |
+| `GET` | `/api/history` | Query event history (params: `service_name`, `event_type`, `limit`) |
 | `DELETE` | `/api/services/:name` | Deregister a service |
 
-## 8. Data Flow Summary
+## 9. Data Flow Summary
 
 ```mermaid
 flowchart TB
@@ -191,6 +246,7 @@ flowchart TB
     A[Flask App]
     B[ServiceRegistryManagement]
     C[Health Check Thread]
+    E[Metrics (SQLite)]
   end
 
   subgraph "Downstream Services"
@@ -208,17 +264,19 @@ flowchart TB
   C -->|HTTP GET every 5s| D4
   C -->|HTTP GET every 5s| D5
   B -->|Metrics| A
+  B -->|Event History| E
+  A -->|Query| E
 ```
 
-## 9. Caveats
+## 10. Caveats
 
 At the moment, there were a few items that needed to be addressed before they were going to be adopted or at least made as production-grade ready. Those are:
 
 - **No async support**. By all means, the service assignment is synchronous and resolves to the first available index. If that service is also unhealthy, no fallback will be attempted automatically
-- **In-memory state**. All registry data is held in memory and does not persist across restarts. There is no database or external storage which holds logs or particular events
+- **Hybrid state model**. The core registry (service registrations, assignments, health status) remains in-memory for performance and it's ephemeral. However, event history is persisted to a local SQLite database that survives restarts. The two layers are intentionally separated: fast in-memory state for runtime operations, durable SQLite storage for audit and observability
 - **Single instance**. No clustering or leader election is implemented
 
-## 10. Getting Started
+## 11. Getting Started
 
 ```bash
 # Start the server
@@ -241,7 +299,7 @@ curl -X POST http://localhost:5000/api/services/MyAPI/call
 curl http://localhost:5000/api/metrics
 ```
 
-## 11. History & Origin
+## 12. History & Origin
 
 This library was initially built as part of the research and development team's effort to implement distributed tracing, alongside tools like Jaeger and OpenTelemetry. Development began in 2023 by myself as an internal exploration into service mesh patterns and self-healing architectures.
 
@@ -249,20 +307,20 @@ Initially, the team did not adopt Jaeger or OpenTelemetry back in 2021. However,
 
 Fast forward to 2026: the chat services needed to become fully independent and required their own lightweight monitoring system. In June 2026, this library resurfaced. The Backend and Frontend teams decided to run live experiments with it as a dedicated health-check and service-assignment layer for the chat infrastructure, reviving the original codebase and extending it with real downstream services
 
-## 12. Production Deployment (24/7)
+## 13. Production Deployment (24/7)
 
 The repository includes a Docker Compose setup designed for continuous operation.
 
-### 12.1 Docker Compose Stack
+### 13.1 Docker Compose Stack
 
 | File | Purpose |
 |------|---------|
-| `Dockerfile` | Python 3.12 slim image with Gunicorn as the WSGI server |
+| `Dockerfile` | Python 3.12 slim image with Gunicorn as the WSGI server. Copies `app.py`, `config.py`, `metrics.py`, `utils.py`, `services.py`, and `service_registry.py`. Installs `libsqlite3-0` as a system dependency for SQLite support |
 | `docker-compose.yml` | Orchestrates the container with restart policy and health checks |
 | `requirements.txt` | Pins Flask, Requests, and Gunicorn versions |
 | `.dockerignore` | Keeps the image lean |
 
-### 12.2 Key Production Settings
+### 13.2 Key Production Settings
 
 - **Gunicorn** runs with 4 workers and a 120-second timeout to handle slow downstream responses.
 - **Restart policy** is set to `always` so the container recovers automatically after a host reboot or crash.
@@ -270,7 +328,7 @@ The repository includes a Docker Compose setup designed for continuous operation
 - **Resource limits** are capped at 1 CPU and 512 MB RAM to prevent a runaway process from starving the host.
 - **Flask** runs with `debug=False` and `threaded=True` for safe concurrent request handling.
 
-### 12.3 Deploy
+### 13.3 Deploy
 
 ```bash
 # Build and start
@@ -283,7 +341,7 @@ docker compose logs -f
 docker compose down && docker compose up --build -d
 ```
 
-### 12.4 Monitoring
+### 13.4 Monitoring
 
 Because the library is in-memory, you should monitor the host itself:
 
@@ -292,13 +350,13 @@ Because the library is in-memory, you should monitor the host itself:
 - **Downstream health** via the `/api/external-health` endpoint (poll every 60s)
 - **Request metrics** via `/api/metrics` (total, success, failure counts)
 
-## 13. Future Considerations
+## 14. Future Considerations
 
 This library is intentionally lightweight, but several enhancements would make it production-grade for a larger mesh. Especially, the targeted environment possibly grows larger since we also need to opt-in the Chat services for other platforms
 
 | Improvement | Rationale |
 |-------------|-----------|
-| **Persistent state** | SQLite or Redis so registrations and assignments survive restarts |
+| **Persistent state (partially addressed)** | Event history is now persisted via SQLite. Future work could extend persistence to service registrations and assignments using SQLite, Redis, or an external database |
 | **Async health checks** | `asyncio` or `aiohttp` to avoid blocking the GIL during slow probes |
 | **Clustering** | Multiple instances with a shared backend (for example, Consul or etcd) for high availability |
 | **Authentication** | API key or mTLS on the registry endpoints to prevent unauthorized deregistration |
