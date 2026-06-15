@@ -246,7 +246,7 @@ flowchart TB
     A[Flask App]
     B[ServiceRegistryManagement]
     C[Health Check Thread]
-    E[Metrics (SQLite)]
+    E[Metrics]
   end
 
   subgraph "Downstream Services"
