@@ -5,6 +5,7 @@ import threading
 import enum
 import typing
 from config import DEFAULT_HEADERS
+from metrics import record_event
 
 
 class CircuitBreakerException(Exception):
@@ -147,6 +148,7 @@ class ServiceRegistry:
                 "availability": ServiceRegistryState.STARTING,
             }
         self.log("Success registered the service name")
+        record_event(service_name, "service_registered", service_url)
 
     def get_service(self, service_name: str) -> str:
         with self._lock:
@@ -164,6 +166,7 @@ class ServiceRegistry:
             return list(self.registered_services.keys())
 
     def simulate_service_is_unhealthy(self, service_name: str) -> None:
+        changed = False
         with self._lock:
             if service_name not in self.registered_services:
                 raise ValueError(
@@ -184,6 +187,9 @@ class ServiceRegistry:
                     ] = ServiceRegistryState.DOWN
                     self.registered_services[service_name]["healthy"] = False
                     self.service_tracing["failure_requests"] += 1
+                    changed = True
+        if changed:
+            record_event(service_name, "service_failure", "simulated failure")
 
     def _get_service_name_url(self, service_name: str) -> str:
         if service_name in self.registered_services:
@@ -252,6 +258,9 @@ class ServiceRegistry:
                 if service_name not in self.registered_services:
                     return None
                 service_url = self.registered_services[service_name]["url"]
+                previous_availability = self.registered_services[service_name][
+                    "availability"
+                ]
 
             response = self._make_http_request(service_url)
 
@@ -263,20 +272,38 @@ class ServiceRegistry:
                     self.registered_services[service_name]["healthy"] = True
                     self.service_tracing["successful_requests"] += 1
                 self.log("Related service is healthy")
+                if previous_availability != ServiceRegistryState.AVAILABLE:
+                    record_event(
+                        service_name,
+                        "health_check_healthy",
+                        "state changed to AVAILABLE",
+                    )
                 return True
         except requests.exceptions.RequestException as e:
+            previous_availability = None
             with self._lock:
                 if service_name in self.registered_services:
+                    previous_availability = self.registered_services[service_name][
+                        "availability"
+                    ]
                     self.registered_services[service_name][
                         "availability"
                     ] = ServiceRegistryState.DOWN
                     self.registered_services[service_name]["healthy"] = False
                     self.service_tracing["failure_requests"] += 1
             self.log(f"Related service is unhealthy due to error: {e}")
+            if (
+                previous_availability is not None
+                and previous_availability != ServiceRegistryState.DOWN
+            ):
+                record_event(
+                    service_name, "health_check_unhealthy", "state changed to DOWN"
+                )
             raise
         return False
 
     def assign_service(self, service_name: str, assigned_service_name: str) -> None:
+        assigned = False
         with self._lock:
             if service_name in self.registered_services:
                 if assigned_service_name in self.registered_services:
@@ -288,10 +315,17 @@ class ServiceRegistry:
                         self.log(
                             "Success assigned one service to the available service"
                         )
+                        assigned = True
                     else:
                         self.log(
                             "Failed to assigned one service to the available service"
                         )
+        if assigned:
+            record_event(
+                service_name,
+                "service_assigned",
+                f"{service_name} assigned to {assigned_service_name}",
+            )
 
     def deregister_service(self, service_name: str) -> None:
         with self._lock:
@@ -303,6 +337,7 @@ class ServiceRegistry:
             # drop any circuit breaker for this service
             self._circuit_breakers.pop(service_name, None)
         self.log(f"Deleted {service_name} service instance")
+        record_event(service_name, "service_deregistered", service_name)
 
     def deregister_all_services(self) -> None:
         # i'm not sure why this method would be called
@@ -360,6 +395,8 @@ class ServiceRegistry:
 
                 self.service_tracing["duration"] += duration
 
+        record_event(service_name, "request_traced", service_name)
+
 
 class ServiceRegistryManagement(ServiceRegistry):
     def __init__(self) -> None:
@@ -372,6 +409,11 @@ class ServiceRegistryManagement(ServiceRegistry):
         self.dependency_map[service_name].append(depends_on)
         self.log(
             f"Successful register the dependencies between {service_name} that depends on {depends_on} services"
+        )
+        record_event(
+            service_name,
+            "dependency_registered",
+            f"{service_name} depends on {depends_on}",
         )
 
     def get_dependencies(self, service_name: str) -> typing.Any:
