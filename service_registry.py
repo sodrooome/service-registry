@@ -84,10 +84,15 @@ class CircuitBreaker:
 # onto ServiceRegistry() classes
 def circuit_breaker(threhsold: int, timeout: int):
     def decorator(func):
-        circuit_breaker = CircuitBreaker(threhsold, timeout)
-
-        def wrapper(*args, **kwargs):
-            return circuit_breaker.make_remote_call(lambda: func(*args, **kwargs))
+        def wrapper(self, service_name, *args, **kwargs):
+            # one breaker per service so when a failing one
+            # won't be tripping the breaker for health checks
+            breaker = self._circuit_breakers.setdefault(
+                service_name, CircuitBreaker(threhsold, timeout)
+            )
+            return breaker.make_remote_call(
+                lambda: func(self, service_name, *args, **kwargs)
+            )
 
         return wrapper
 
@@ -108,6 +113,7 @@ class ServiceRegistry:
         self.timestamp = time.time()
         self._lock = threading.Lock()
         self._setup_logger()
+        self._circuit_breakers: dict[str, CircuitBreaker] = {}
 
     def _setup_logger(self) -> None:
         self.logger = logging.getLogger(f"service_registry_{id(self)}")
@@ -221,8 +227,15 @@ class ServiceRegistry:
     def _health_check(self) -> None:
         while True:
             try:
-                for service_name in self.registered_services:
-                    self._simulate_health_check(service_name)
+                # snapshot the lock before iterating avoiding race condition
+                with self._lock:
+                    service_names = list(self.registered_services.keys())
+
+                for service_name in service_names:
+                    try:
+                        self._simulate_health_check(service_name=service_name)
+                    except CircuitBreakerException as e:
+                        self.log(f"Health check skipped for {service_name}")
             except Exception as e:
                 self.log(f"Health check error: {e}")
             time.sleep(self.health_check_interval)
@@ -287,6 +300,8 @@ class ServiceRegistry:
                     "Service name is not registered in the list of service register"
                 )
             del self.registered_services[service_name]
+            # drop any circuit breaker for this service
+            self._circuit_breakers.pop(service_name, None)
         self.log(f"Deleted {service_name} service instance")
 
     def deregister_all_services(self) -> None:
