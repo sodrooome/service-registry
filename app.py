@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 from utils import check_downstream_health, DEFAULT_HEADERS
 from config import DOWNSTREAM_SERVICES
 from services import registry
+from metrics import get_events
 
 app = Flask(__name__)
 
@@ -131,6 +132,17 @@ def add_dependency():
 
     registry.register_dependency(service_name=service_name, depends_on=depends_on)
     return jsonify({"message": "Dependency registered successfully"}), 201
+
+
+# fetch all the metrics history based on the database table
+@app.route("/api/history", methods=["GET"])
+def get_history():
+    service_name = request.args.get("service_name")
+    event_type = request.args.get("event_type")
+    limit = request.args.get("limit", default=100, type=int)
+
+    events = get_events(service_name=service_name, event_type=event_type, limit=limit)
+    return jsonify(events), 200
 
 
 if __name__ == "__main__":
