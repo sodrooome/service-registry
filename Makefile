@@ -11,3 +11,9 @@ stop:
 
 logs:
 	sudo docker compose logs -f
+
+docs-build:
+	mkdocs build
+
+docs-serve:
+	mkdocs serve
