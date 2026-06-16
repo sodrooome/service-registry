@@ -19,6 +19,8 @@ Given the context, we can implement several features that might help in the proc
 - Distributed services tracing (trace all of the failure and success counts)
 - Built-in logging mechanism
 - Gracefully shutdown a certain service
+- Thread-safe concurrent access with `threading.Lock` synchronization
+- Persistent event history — all service registrations, failures, assignments, health transitions, and request traces are recorded in a local SQLite database and queryable via API
 
 ### Usage
 
@@ -90,10 +92,37 @@ curl -X POST http://localhost:5000/api/services/GetAllPosts/fail
 curl http://localhost:5000/api/metrics
 ```
 
+**View event history**
+
+```sh
+curl http://localhost:5000/api/history
+```
+
+**Filter history by service name:**
+
+```sh
+curl "http://localhost:5000/api/history?service_name=GetAllPosts"
+```
+
+**Filter history by event type:**
+
+```sh
+curl "http://localhost:5000/api/history?event_type=service_failure"
+```
+
+**Limit results:**
+
+```sh
+curl "http://localhost:5000/api/history?limit=5"
+```
+
+> [!TIP]
+> If you want to see the detailed information about the design, architecture, complete API reference alongside deployment instructions, you can check the [Architecture Document](./docs/architecture.md) that has been written in a more comprehensive way
+
 ### Caveats
 
 - No async support. By all means, the service assignment is synchronous and resolves to the first available index. If that service is also unhealthy, no fallback will be attempted automatically
-- In-memory state. All registry data is held in memory and does not persist across restarts
+- In-memory state. The core registry state remains in memory (fast and ephemeral), but event history is now persisted to a local SQLite database so it survives restarts
 
 ### Acknowledgment
 

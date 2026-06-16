@@ -1,0 +1,29 @@
+services:
+  service-registry:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: service-registry
+    ports:
+      - "5000:5000"
+    environment:
+      - PYTHONUNBUFFERED=1
+    env_file: .env
+      # Optional: tweak gunicorn workers without rebuilding image
+      # - GUNICORN_WORKERS=4
+    restart: always
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    # Resource limits to prevent runaway growth
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 128M

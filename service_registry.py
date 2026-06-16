@@ -2,16 +2,17 @@ import logging
 import requests
 import time
 import threading
-import atexit
 import enum
 import typing
+from config import DEFAULT_HEADERS
+from metrics import record_event
 
 
-class CircuitBreakerException(BaseException):
+class CircuitBreakerException(Exception):
     """Exception that arises when remote call is failed"""
 
 
-class RequestCallException(BaseException):
+class RequestCallException(Exception):
     """Exception that arises when request is failed"""
 
 
@@ -36,9 +37,12 @@ class CircuitBreaker:
         self.last_time_of_failure = None
         self.timestamp = time.time()
 
+        # lock to guard all shared state against concurrent access
+        self._lock = threading.Lock()
+
     def open(self) -> None:
         self.state = CircuitBreakerState.OPEN
-        self.last_time_of_failure = self.timestamp
+        self.last_time_of_failure = time.time()
 
     def close(self) -> None:
         self.state = CircuitBreakerState.CLOSED
@@ -51,33 +55,45 @@ class CircuitBreaker:
         return self.failure_counts >= self.threshold
 
     def handle_reset_state(self) -> typing.Any:
-        return self.timestamp - self.last_time_of_failure >= self.timeout
+        return time.time() - self.last_time_of_failure >= self.timeout
 
     def make_remote_call(self, func) -> typing.Any:
-        if self.state == CircuitBreakerState.OPEN:
-            if not self.handle_reset_state():
-                return None
+        # acquire lock for the full state between check and transition
+        with self._lock:
+            if self.state == CircuitBreakerState.OPEN:
+                if not self.handle_reset_state():
+                    raise CircuitBreakerException(
+                        "Circuit is still OPEN, call rejected until timeout exhausted"
+                    )
+                self.half_open()
 
         try:
             result_value = func()
-            if self.state == CircuitBreakerState.HALF_OPEN:
-                self.close()
+            with self._lock:
+                if self.state == CircuitBreakerState.HALF_OPEN:
+                    self.close()
             return result_value
         except Exception as e:
-            self.failure_counts += 1
-            if self.handle_open_state():
-                self.open()
-            raise CircuitBreakerException
+            with self._lock:
+                self.failure_counts += 1
+                if self.handle_open_state():
+                    self.open()
+            raise CircuitBreakerException(f"Remote call failed: {e}") from e
 
 
 # wrapped it as around decorator so it's easily extended
 # onto ServiceRegistry() classes
 def circuit_breaker(threhsold: int, timeout: int):
     def decorator(func):
-        circuit_breaker = CircuitBreaker(threhsold, timeout)
-
-        def wrapper(*args, **kwargs):
-            return circuit_breaker.make_remote_call(lambda: func(*args, **kwargs))
+        def wrapper(self, service_name, *args, **kwargs):
+            # one breaker per service so when a failing one
+            # won't be tripping the breaker for health checks
+            breaker = self._circuit_breakers.setdefault(
+                service_name, CircuitBreaker(threhsold, timeout)
+            )
+            return breaker.make_remote_call(
+                lambda: func(self, service_name, *args, **kwargs)
+            )
 
         return wrapper
 
@@ -96,67 +112,84 @@ class ServiceRegistry:
             "duration": 0,
         }
         self.timestamp = time.time()
+        self._lock = threading.Lock()
+        self._setup_logger()
+        self._circuit_breakers: dict[str, CircuitBreaker] = {}
+
+    def _setup_logger(self) -> None:
+        self.logger = logging.getLogger(f"service_registry_{id(self)}")
+        self.logger.setLevel(logging.DEBUG)
+        if not self.logger.handlers:
+            handler = logging.StreamHandler()
+            handler.setFormatter(
+                logging.Formatter(
+                    fmt="%(asctime)s : %(filename)s : %(funcName)s : %(message)s",
+                    datefmt="%d-%m-%Y %I:%M:%S",
+                ),
+            )
+            self.logger.addHandler(handler)
+        self.logger.propagate = False
 
     def log(self, message: str) -> None:
-        logger = logging.getLogger("http_service_registry_logs")
-        log_handler = logging.StreamHandler()
-        log_handler.setFormatter(
-            logging.Formatter(
-                fmt="%(asctime)s : %(filename)s : %(funcName)s : %(message)s",
-                datefmt="%d-%m-%Y %I:%M:%S",
-            ),
-        )
-        logger.addHandler(log_handler)
-        logger.setLevel(logging.DEBUG)
-        logger.propagate = True
-        logger.info(message)
+        self.logger.info(message)
 
     def register_services(self, service_name: str, service_url: str) -> None:
-        if service_name in self.registered_services:
-            raise ValueError(
-                "Service already registered, please use another service name"
-            )
-        self.registered_services[service_name] = {
-            "url": service_url,
-            "service_name": service_name,
-            "assigned": False,
-            "assigned_service": None,
-            "healthy": True,
-            "availability": ServiceRegistryState.STARTING,
-        }
+        with self._lock:
+            if service_name in self.registered_services:
+                raise ValueError(
+                    "Service already registered, please use another service name"
+                )
+            self.registered_services[service_name] = {
+                "url": service_url,
+                "service_name": service_name,
+                "assigned": False,
+                "assigned_service": None,
+                "healthy": True,
+                "availability": ServiceRegistryState.STARTING,
+            }
         self.log("Success registered the service name")
+        record_event(service_name, "service_registered", service_url)
 
     def get_service(self, service_name: str) -> str:
-        if service_name not in self.registered_services:
-            raise ValueError(
-                "Service name is not registered in the list of service register"
-            )
-        if not self.registered_services[service_name]["healthy"]:
-            raise ValueError("Service name is not healthy")
-        return self.registered_services[service_name]["url"]
+        with self._lock:
+            if service_name not in self.registered_services:
+                raise ValueError(
+                    "Service name is not registered in the list of service register"
+                )
+            if not self.registered_services[service_name]["healthy"]:
+                raise ValueError("Service name is not healthy")
+            return self.registered_services[service_name]["url"]
 
     @property
     def list_of_all_services(self) -> list:
-        return list(self.registered_services.keys())
+        with self._lock:
+            return list(self.registered_services.keys())
 
     def simulate_service_is_unhealthy(self, service_name: str) -> None:
-        if service_name not in self.registered_services:
-            raise ValueError(
-                "Service name is not registered in the list of service register"
-            )
+        changed = False
+        with self._lock:
+            if service_name not in self.registered_services:
+                raise ValueError(
+                    "Service name is not registered in the list of service register"
+                )
 
-        service_availability = self.registered_services[service_name]["availability"]
+            service_availability = self.registered_services[service_name][
+                "availability"
+            ]
 
-        if self.registered_services[service_name]["healthy"]:
-            if service_availability == ServiceRegistryState.AVAILABLE:
-                # simulate when the service is healthy, change the
-                # availability, healthy status to down and also
-                # increase the numbers of failure count
-                self.registered_services[service_name][
-                    "availability"
-                ] = ServiceRegistryState.DOWN
-                self.registered_services[service_name]["healthy"] = False
-                self.service_tracing["failure_requests"] += 1
+            if self.registered_services[service_name]["healthy"]:
+                if service_availability == ServiceRegistryState.AVAILABLE:
+                    # simulate when the service is healthy, change the
+                    # availability, healthy status to down and also
+                    # increase the numbers of failure count
+                    self.registered_services[service_name][
+                        "availability"
+                    ] = ServiceRegistryState.DOWN
+                    self.registered_services[service_name]["healthy"] = False
+                    self.service_tracing["failure_requests"] += 1
+                    changed = True
+        if changed:
+            record_event(service_name, "service_failure", "simulated failure")
 
     def _get_service_name_url(self, service_name: str) -> str:
         if service_name in self.registered_services:
@@ -164,104 +197,157 @@ class ServiceRegistry:
         return None
 
     def get_available_services(self, service_name: str) -> str:
-        if service_name in self.registered_services:
-            if self.registered_services[service_name]["assigned"]:
-                assigned_service = self.registered_services[service_name][
-                    "assigned_service"
-                ]
-                return self._get_service_name_url(assigned_service)
+        with self._lock:
+            if service_name in self.registered_services:
+                if self.registered_services[service_name]["assigned"]:
+                    assigned_service = self.registered_services[service_name][
+                        "assigned_service"
+                    ]
+                    return self._get_service_name_url(assigned_service)
 
-        if service_name in self.registered_services:
-            if self.registered_services[service_name]["healthy"]:
-                return self._get_service_name_url(service_name)
+            if service_name in self.registered_services:
+                if self.registered_services[service_name]["healthy"]:
+                    return self._get_service_name_url(service_name)
 
-        available_services = [
-            name
-            for name, data in self.registered_services.items()
-            if data["availability"] == ServiceRegistryState.AVAILABLE
-        ]
+            available_services = [
+                name
+                for name, data in self.registered_services.items()
+                if data["availability"] == ServiceRegistryState.AVAILABLE
+            ]
 
-        # currently, this function would be picked
-        # the available service based on the first index
-        if available_services:
-            return self._get_service_name_url(available_services)
+            # currently, this function would be picked
+            # the available service based on the first index
+            if available_services:
+                return self._get_service_name_url(available_services[0])
 
         return None
 
     def gracefully_shutdown(self, service_name: str) -> None:
-        if service_name in self.registered_services:
-            self.registered_services[service_name][
-                "availability"
-            ] = ServiceRegistryState.DOWN
-            self.deregister_service(service_name)
+        with self._lock:
+            if service_name in self.registered_services:
+                self.registered_services[service_name][
+                    "availability"
+                ] = ServiceRegistryState.DOWN
+        self.deregister_service(service_name)
 
     def _health_check(self) -> None:
         while True:
-            for service_name in self.registered_services:
-                is_service_healthy = self._simulate_health_check(service_name)
-                self.registered_services[service_name]["healthy"] = is_service_healthy
+            try:
+                # snapshot the lock before iterating avoiding race condition
+                with self._lock:
+                    service_names = list(self.registered_services.keys())
+
+                for service_name in service_names:
+                    try:
+                        self._simulate_health_check(service_name=service_name)
+                    except CircuitBreakerException as e:
+                        self.log(f"Health check skipped for {service_name}")
+            except Exception as e:
+                self.log(f"Health check error: {e}")
             time.sleep(self.health_check_interval)
 
     def _make_http_request(self, service_url: str) -> requests.Response:
-        session = requests.Session()
-        response = session.get(url=service_url)
+        response = requests.get(url=service_url, headers=DEFAULT_HEADERS, timeout=10)
         response.raise_for_status()
         return response
 
     @circuit_breaker(threhsold=3, timeout=5)
-    def _simulate_health_check(self, service_name: str) -> None:
-        while True:
-            try:
+    def _simulate_health_check(self, service_name: str) -> bool:
+        try:
+            with self._lock:
+                if service_name not in self.registered_services:
+                    return None
                 service_url = self.registered_services[service_name]["url"]
-                response = self._make_http_request(service_url)
-                if response.status_code == 200:
-                    if self.registered_services[service_name]["healthy"]:
-                        self.registered_services[service_name][
-                            "availability"
-                        ] = ServiceRegistryState.AVAILABLE
-                        self.registered_services[service_name]["healthy"] = True
-                        self.log("Related service is healthy")
-                    else:
-                        self.registered_services[service_name][
-                            "availability"
-                        ] = ServiceRegistryState.DOWN
-                        self.registered_services[service_name]["healthy"] = False
-                        self.log("Related service is unhealthy")
-            except requests.exceptions.RequestException as e:
-                self.registered_services[service_name]["healthy"] = False
+                previous_availability = self.registered_services[service_name][
+                    "availability"
+                ]
 
-                # marked all of the exceptions that occurs as failure request
-                self.service_tracing["failure_requests"] += 1
-                raise Exception(f"Unable to make a request due of error : {e}")
+            response = self._make_http_request(service_url)
 
-            time.sleep(self.health_check_interval)
+            if response.status_code == 200:
+                with self._lock:
+                    self.registered_services[service_name][
+                        "availability"
+                    ] = ServiceRegistryState.AVAILABLE
+                    self.registered_services[service_name]["healthy"] = True
+                    self.service_tracing["successful_requests"] += 1
+                self.log("Related service is healthy")
+                if previous_availability != ServiceRegistryState.AVAILABLE:
+                    record_event(
+                        service_name,
+                        "health_check_healthy",
+                        "state changed to AVAILABLE",
+                    )
+                return True
+        except requests.exceptions.RequestException as e:
+            previous_availability = None
+            with self._lock:
+                if service_name in self.registered_services:
+                    previous_availability = self.registered_services[service_name][
+                        "availability"
+                    ]
+                    self.registered_services[service_name][
+                        "availability"
+                    ] = ServiceRegistryState.DOWN
+                    self.registered_services[service_name]["healthy"] = False
+                    self.service_tracing["failure_requests"] += 1
+            self.log(f"Related service is unhealthy due to error: {e}")
+            if (
+                previous_availability is not None
+                and previous_availability != ServiceRegistryState.DOWN
+            ):
+                record_event(
+                    service_name, "health_check_unhealthy", "state changed to DOWN"
+                )
+            raise
+        return False
 
     def assign_service(self, service_name: str, assigned_service_name: str) -> None:
-        if service_name in self.registered_services:
-            if assigned_service_name in self.registered_services:
-                if self.registered_services[assigned_service_name]["healthy"]:
-                    self.registered_services[service_name]["assigned"] = True
-                    self.registered_services[service_name][
-                        "assigned_service"
-                    ] = assigned_service_name
-                    self.log("Success assigned one service to the available service")
-                else:
-                    self.log("Failed to assigned one service to the available service")
+        assigned = False
+        with self._lock:
+            if service_name in self.registered_services:
+                if assigned_service_name in self.registered_services:
+                    if self.registered_services[assigned_service_name]["healthy"]:
+                        self.registered_services[service_name]["assigned"] = True
+                        self.registered_services[service_name][
+                            "assigned_service"
+                        ] = assigned_service_name
+                        self.log(
+                            "Success assigned one service to the available service"
+                        )
+                        assigned = True
+                    else:
+                        self.log(
+                            "Failed to assigned one service to the available service"
+                        )
+        if assigned:
+            record_event(
+                service_name,
+                "service_assigned",
+                f"{service_name} assigned to {assigned_service_name}",
+            )
 
     def deregister_service(self, service_name: str) -> None:
-        if service_name not in self.registered_services:
-            raise ValueError(
-                "Service name is not registered in the list of service register"
-            )
-        del self.registered_services[service_name]
+        with self._lock:
+            if service_name not in self.registered_services:
+                raise ValueError(
+                    "Service name is not registered in the list of service register"
+                )
+            del self.registered_services[service_name]
+            # drop any circuit breaker for this service
+            self._circuit_breakers.pop(service_name, None)
         self.log(f"Deleted {service_name} service instance")
+        record_event(service_name, "service_deregistered", service_name)
 
     def deregister_all_services(self) -> None:
         # i'm not sure why this method would be called
         # after the process is completed
         for service_name in self.list_of_all_services:
-            self.deregister_service(service_name)
-            self.log("Deleted all registered services name")
+            try:
+                self.deregister_service(service_name)
+            except ValueError:
+                pass  # already removed during concurrent process
+        self.log("Deleted all registered services name")
 
     def start_health_check(self) -> None:
         health_check_thread = threading.Thread(target=self._health_check)
@@ -270,22 +356,24 @@ class ServiceRegistry:
 
     def get_services_information(self) -> dict:
         services_result = {}
-        for service_name, service_data in self.registered_services.items():
-            services_result[service_name] = {
-                "url": service_data["url"],
-                "assigned": service_data["assigned"],
-                "assigned_service": service_data["assigned_service"],
-                "availability": service_data["availability"].value,
-            }
+        with self._lock:
+            for service_name, service_data in self.registered_services.items():
+                services_result[service_name] = {
+                    "url": service_data["url"],
+                    "assigned": service_data["assigned"],
+                    "assigned_service": service_data["assigned_service"],
+                    "availability": service_data["availability"].value,
+                }
         return services_result
 
     def trace_service_request(self, service_name: str) -> None:
-        start_time = self.timestamp
+        start_time = time.time()
 
-        if service_name not in self.registered_services:
-            raise ValueError(
-                "Service name is not registered in the list of service register"
-            )
+        with self._lock:
+            if service_name not in self.registered_services:
+                raise ValueError(
+                    "Service name is not registered in the list of service register"
+                )
 
         try:
             # simulate a request to the certain service
@@ -295,16 +383,19 @@ class ServiceRegistry:
             success = False
             raise RequestCallException
         finally:
-            end_time = self.timestamp
+            end_time = time.time()
             duration = end_time - start_time
 
-            self.service_tracing["total_requests"] += 1
-            if success:
-                self.service_tracing["successful_requests"] += 1
-            else:
-                self.service_tracing["failure_requests"] += 1
+            with self._lock:
+                self.service_tracing["total_requests"] += 1
+                if success:
+                    self.service_tracing["successful_requests"] += 1
+                else:
+                    self.service_tracing["failure_requests"] += 1
 
-            self.service_tracing["duration"] += duration
+                self.service_tracing["duration"] += duration
+
+        record_event(service_name, "request_traced", service_name)
 
 
 class ServiceRegistryManagement(ServiceRegistry):
@@ -319,6 +410,11 @@ class ServiceRegistryManagement(ServiceRegistry):
         self.log(
             f"Successful register the dependencies between {service_name} that depends on {depends_on} services"
         )
+        record_event(
+            service_name,
+            "dependency_registered",
+            f"{service_name} depends on {depends_on}",
+        )
 
     def get_dependencies(self, service_name: str) -> typing.Any:
         return self.dependency_map.get(service_name, [])
@@ -328,87 +424,10 @@ class ServiceRegistryManagement(ServiceRegistry):
         return all(self.get_available_services(dep) for dep in dependencies)
 
     def wait_for_dependencies(self, service_name: str, timeout: int = 30) -> bool:
-        start_time = self.timestamp
+        start_time = time.time()
         while not self.is_service_ready(service_name):
-            if self.timestamp - start_time > timeout:
+            if time.time() - start_time > timeout:
                 return False
             # for now just align the sleep interval with the health check
             time.sleep(self.health_check_interval)
         return True
-
-
-if __name__ == "__main__":
-    registry = ServiceRegistry()
-
-    # register all the related services
-    registry.register_services(
-        "GetSinglePost", "https://jsonplaceholder.typicode.com/posts/1"
-    )
-    registry.register_services(
-        "GetAllPosts", "https://jsonplaceholder.typicode.com/posts"
-    )
-
-    registry.start_health_check()
-
-    check_duration = time.sleep(5)
-    while check_duration:
-        pass
-
-    result_val = registry.get_services_information()
-    print(result_val)
-
-    # tracing between request
-    registry.trace_service_request("GetSinglePost")
-    print(registry.service_tracing)
-
-    registry.get_service("GetSinglePost")
-
-    # simulate the one of the services are unhealthy
-    registry.simulate_service_is_unhealthy("GetSinglePost")
-
-    print(registry.service_tracing)
-
-    # assign the "unhealthy" services to the available service
-    registry.assign_service("GetSinglePost", "GetAllPosts")
-
-    get_url = registry.get_available_services("GetSinglePost")
-    print(get_url)
-
-    # usage of extended service registry
-    # first, we need to register the services first and initialize the instance
-    extended_registry = ServiceRegistryManagement()
-    extended_registry.register_services(
-        "ServiceA", "https://jsonplaceholder.typicode.com/posts/1"
-    )
-    extended_registry.register_services(
-        "ServiceB", "https://jsonplaceholder.typicode.com/posts/2"
-    )
-
-    # and now we will register for each dependencies
-    extended_registry.register_dependency("ServiceA", "ServiceB")
-
-    # check whether the dependent service is available or not
-    get_services_ready = extended_registry.is_service_ready("ServiceB")
-    if get_services_ready:
-        print("Each services are ready, no need to wait")
-    else:
-        # wait another services until it's ready
-        extended_registry.wait_for_dependencies("ServiceB")
-
-    # this will thrown a failure since the service name is unhealthy
-    # and all of the process will halted directly
-    # registry.get_service("GetSinglePost")
-
-    # de-register all of the services whether it's up or down
-    # registry.deregister_all_services()
-
-    # de-register a certain service based on the service name
-    # registry.deregister_service("GetAllPosts")
-
-    # gracefully shutdown a single service
-    registry.gracefully_shutdown("GetSinglePost")
-
-    # this will return the value as None since we already
-    # gracefully shut-in down the GetSinglePost service
-    get_url = registry.get_available_services("GetSinglePost")
-    print(get_url)

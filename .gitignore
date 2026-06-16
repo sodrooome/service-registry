@@ -1,0 +1,6 @@
+__pycache__/
+.env
+.omo/
+.pytest_cache/
+site/
+metrics_history.db
